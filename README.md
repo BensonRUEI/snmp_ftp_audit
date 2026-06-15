@@ -6,6 +6,8 @@
 * SNMP community 是否可讀取
 * SNMP community 是否可寫入，需手動啟用
 * FTP 是否可使用常見帳號密碼登入
+* FTP 成功登入後自動列出根目錄檔案清單
+* 多主機、多帳密同時並行掃描，加快整體效率
 * 掃描完成後自動產生 JSON、CSV、HTML 報告
 
 > 本工具設計用途為內部資安稽核、弱點盤點、設備設定檢查與合規檢測。請只在已取得授權的網路環境中使用。
@@ -284,11 +286,13 @@ sudo python3 audit_snmp_ftp.py --mode ftp --pn
 | `--snmp-timeout`     | SNMP 逾時秒數                 | `2`            |
 | `--snmp-delay`       | 每次 SNMP 測試間隔秒數            | `0.1`          |
 | `--snmp-write-test`  | 啟用 SNMP 寫入測試              | 關閉             |
-| `--ftp-timeout`      | FTP 連線逾時秒數                | `4`            |
-| `--ftp-delay`        | 每次 FTP 登入測試間隔秒數           | `0.2`          |
+| `--ftp-timeout`      | FTP 單次連線逾時秒數（整體上限為此值 × 4） | `4`            |
+| `--ftp-delay`        | 每次 FTP 登入測試間隔秒數（串列模式保留參數）  | `0.2`          |
 | `--ftp-max-attempts` | 每台 FTP 主機最多嘗試次數，`0` 代表不限制 | `150`          |
 | `--ftp-find-all`     | 找到第一組成功帳密後仍繼續測試           | 關閉             |
 | `--no-anonymous`     | 不測試 anonymous FTP         | 關閉             |
+| `--ftp-workers`      | 每台主機同時測試的 FTP 帳密執行緒數      | `8`            |
+| `--workers`          | 同時稽核的主機數量（主機層級平行）         | `4`            |
 
 ---
 
@@ -350,6 +354,38 @@ sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-delay 1
 
 ---
 
+### 調整 FTP 平行執行緒數
+
+減少每台主機同時測試的執行緒，降低對設備的壓力：
+
+```bash
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-workers 3
+```
+
+增加執行緒加快速度（網路環境允許時）：
+
+```bash
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-workers 16
+```
+
+---
+
+### 調整主機層級平行數
+
+同時稽核更多主機：
+
+```bash
+sudo python3 audit_snmp_ftp.py --mode all --pn --workers 8
+```
+
+對慢速環境降低並行數：
+
+```bash
+sudo python3 audit_snmp_ftp.py --mode all --pn --workers 2 --ftp-workers 3
+```
+
+---
+
 ### 找出每台 FTP 所有成功帳密
 
 ```bash
@@ -383,7 +419,7 @@ snmp_ftp_audit_ftp_時間.html
 | 報告格式 | 用途                     |
 | ---- | ---------------------- |
 | JSON | 後續自動化分析、串接 SIEM、留存原始結果 |
-| CSV  | 匯入 Excel、資產清冊、弱點管理平台   |
+| CSV  | 匯入 Excel、資產清冊、弱點管理平台（含 `ftp_file_list` 欄位）  |
 | HTML | 人工檢視、交付稽核報告、快速瀏覽風險     |
 
 ---
@@ -415,7 +451,8 @@ HTML 報告會包含：
 * High / Medium / Low 風險統計
 * 主機明細
 * FTP 成功帳密
-* FTP banner
+* FTP Banner
+* FTP 根目錄檔案列表（成功登入後自動列出，依帳密分組顯示）
 * SNMP 可讀 community
 * SNMP 可寫 community
 * SNMP sysDescr
@@ -550,7 +587,19 @@ sudo python3 audit_snmp_ftp.py --mode snmp --pn --max-retries 3 --snmp-timeout 3
 
 ### FTP 掃描太慢
 
-可降低每台主機嘗試次數：
+使用 `--ftp-workers` 增加每台主機同時測試的執行緒數（預設 8）：
+
+```bash
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-workers 16
+```
+
+使用 `--workers` 增加同時稽核的主機數量（預設 4）：
+
+```bash
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --workers 8
+```
+
+也可以降低每台主機嘗試次數：
 
 ```bash
 sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-max-attempts 50

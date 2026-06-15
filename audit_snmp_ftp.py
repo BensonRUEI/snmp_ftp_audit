@@ -1,5 +1,6 @@
 ﻿#!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import csv
 import ftplib
 import html
@@ -10,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
@@ -37,6 +39,7 @@ class FTPResult:
     success: bool
     banner: Optional[str]
     note: Optional[str]
+    file_list: Optional[List[str]] = None
 
 
 @dataclass
@@ -522,41 +525,73 @@ def try_ftp_login(
     password: str,
     timeout_sec: int,
 ) -> FTPResult:
-    ftp = ftplib.FTP()
-    banner = None
+    # 整體逾時上限：connect + banner + USER + PASS + quit 各最多 timeout_sec，
+    # 加總最壞情況約 5x，設 4x 以避免設備太慢時無限卡住。
+    overall_timeout = timeout_sec * 4
+    result_holder: List[FTPResult] = []
 
-    try:
-        ftp.connect(host=host, port=21, timeout=timeout_sec)
-        banner = ftp.getwelcome()
-        ftp.login(user=username, passwd=password)
+    def _do() -> None:
+        ftp = ftplib.FTP()
+        banner = None
 
         try:
-            ftp.quit()
-        except Exception:
-            pass
+            ftp.connect(host=host, port=21, timeout=timeout_sec)
+            banner = ftp.getwelcome()
+            ftp.login(user=username, passwd=password)
 
-        return FTPResult(
-            username=username,
-            password=password,
-            success=True,
-            banner=banner,
-            note=None,
-        )
+            # 登入成功後取得根目錄檔案列表
+            file_list: Optional[List[str]] = None
+            try:
+                listing: List[str] = []
+                ftp.dir(listing.append)
+                file_list = listing if listing else []
+            except Exception:
+                file_list = []
 
-    except Exception as e:
-        return FTPResult(
-            username=username,
-            password=password,
-            success=False,
-            banner=banner,
-            note=str(e),
-        )
+            try:
+                ftp.quit()
+            except Exception:
+                pass
 
-    finally:
-        try:
-            ftp.close()
-        except Exception:
-            pass
+            result_holder.append(FTPResult(
+                username=username,
+                password=password,
+                success=True,
+                banner=banner,
+                note=None,
+                file_list=file_list,
+            ))
+
+        except Exception as e:
+            result_holder.append(FTPResult(
+                username=username,
+                password=password,
+                success=False,
+                banner=banner,
+                note=str(e),
+            ))
+
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout=overall_timeout)
+
+    if result_holder:
+        return result_holder[0]
+
+    # 執行緒仍在跑表示整體逾時，daemon=True 確保程式結束時不阻擋
+    return FTPResult(
+        username=username,
+        password=password,
+        success=False,
+        banner=None,
+        note=f"整體連線逾時（>{overall_timeout}s）",
+    )
 
 
 def audit_ftp_host(
@@ -570,6 +605,7 @@ def audit_ftp_host(
     max_attempts: int,
     find_all: bool,
     include_anonymous: bool,
+    workers: int = 8,
 ) -> List[FTPResult]:
     results: List[FTPResult] = []
     test_pairs: List[Tuple[str, str]] = []
@@ -582,29 +618,31 @@ def audit_ftp_host(
     else:
         test_pairs.extend(list(itertools.product(users, passwords)))
 
-    attempts = 0
+    if max_attempts > 0:
+        test_pairs = test_pairs[:max_attempts]
 
-    for username, password in test_pairs:
-        if max_attempts > 0 and attempts >= max_attempts:
-            break
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        # 一次提交所有任務；executor 依 workers 限制同時執行數，
+        # 未啟動的任務可透過 cancel() 跳過，達到 find_all=False 快速中止。
+        future_map = {
+            executor.submit(try_ftp_login, host, username, password, timeout_sec): (username, password)
+            for username, password in test_pairs
+        }
 
-        attempts += 1
+        for future in concurrent.futures.as_completed(future_map):
+            try:
+                result = future.result()
+            except Exception:
+                continue
 
-        result = try_ftp_login(
-            host=host,
-            username=username,
-            password=password,
-            timeout_sec=timeout_sec,
-        )
+            if result.success:
+                results.append(result)
 
-        if result.success:
-            results.append(result)
-
-            if not find_all:
-                break
-
-        if delay_sec > 0:
-            time.sleep(delay_sec)
+                if not find_all:
+                    # 取消尚未啟動的佇列任務
+                    for f in future_map:
+                        f.cancel()
+                    break
 
     return results
 
@@ -697,6 +735,7 @@ def write_csv_report(results: List[HostResult], path: str) -> None:
             "snmp_open",
             "ftp_success_logins",
             "ftp_banner",
+            "ftp_file_list",
             "snmp_readable_communities",
             "snmp_writable_communities",
             "snmp_sysdescr",
@@ -714,6 +753,11 @@ def write_csv_report(results: List[HostResult], path: str) -> None:
                 for x in host_result.ftp_results
                 if x.banner
             ]
+
+            ftp_files: List[str] = []
+            for x in host_result.ftp_results:
+                if x.success and x.file_list:
+                    ftp_files.extend(x.file_list)
 
             snmp_readable = [
                 x.community
@@ -740,6 +784,7 @@ def write_csv_report(results: List[HostResult], path: str) -> None:
                 host_result.snmp_open,
                 "; ".join(ftp_success),
                 " | ".join(ftp_banners[:3]),
+                "\n".join(ftp_files),
                 "; ".join(snmp_readable),
                 "; ".join(snmp_writable),
                 " | ".join(sysdescr_list[:3]),
@@ -779,6 +824,14 @@ def write_html_report(
             if x.banner
         ]
 
+        # 收集所有成功登入的檔案列表（帳密 + 清單）
+        ftp_file_sections: List[str] = []
+        for x in host_result.ftp_results:
+            if x.success and x.file_list is not None:
+                header = html_escape(f"{x.username}:{x.password}")
+                entries = "<br>".join(html_escape(line) for line in x.file_list) if x.file_list else "（空目錄）"
+                ftp_file_sections.append(f"<b>{header}</b><br><pre style='margin:2px 0;font-size:12px'>{entries}</pre>")
+
         snmp_readable = [
             x.community
             for x in host_result.snmp_results
@@ -805,6 +858,7 @@ def write_html_report(
             <td>{html_escape("OPEN" if host_result.snmp_open else "-")}</td>
             <td>{html_escape("; ".join(ftp_success))}</td>
             <td>{html_escape(" | ".join(ftp_banners[:3]))}</td>
+            <td>{"".join(ftp_file_sections) if ftp_file_sections else ""}</td>
             <td>{html_escape("; ".join(snmp_readable))}</td>
             <td>{html_escape("; ".join(snmp_writable))}</td>
             <td>{html_escape(" | ".join(sysdescr_list[:3]))}</td>
@@ -925,6 +979,7 @@ code {{
     <th>SNMP</th>
     <th>FTP 成功帳密</th>
     <th>FTP Banner</th>
+    <th>FTP 根目錄檔案列表</th>
     <th>SNMP 可讀 community</th>
     <th>SNMP 可寫 community</th>
     <th>SNMP sysDescr</th>
@@ -975,6 +1030,13 @@ def print_console_report(results: List[HostResult], summary: Dict[str, int]) -> 
 
             for login in ftp_success:
                 print(f"    [+] {login.username}:{login.password}")
+                if login.file_list is not None:
+                    if login.file_list:
+                        print("        根目錄檔案列表：")
+                        for entry in login.file_list:
+                            print(f"          {entry}")
+                    else:
+                        print("        根目錄：（空目錄）")
 
         snmp_readable = [x for x in item.snmp_results if x.readable]
 
@@ -997,6 +1059,58 @@ def print_console_report(results: List[HostResult], summary: Dict[str, int]) -> 
                     sysdescr = sysdescr[:120] + "..."
 
                 print(f"    [+] {snmp.community} / writable={writable_text} / {sysdescr}")
+
+
+def _audit_one_host(
+    host: str,
+    service: Dict[str, bool],
+    args: argparse.Namespace,
+    communities: List[str],
+    ftp_users: List[str],
+    ftp_passwords: List[str],
+    ftp_pairs: List[Tuple[str, str]],
+    ftp_mode: str,
+) -> HostResult:
+    print(f"\n[*] 稽核主機：{host}")
+
+    ftp_results: List[FTPResult] = []
+    snmp_results: List[SNMPResult] = []
+
+    if args.mode in ["all", "snmp"] and service.get("snmp"):
+        print(f"    [{host}] SNMP UDP/161 open，測試 community string")
+
+        snmp_results = audit_snmp_host(
+            host=host,
+            communities=communities,
+            write_test=args.snmp_write_test,
+            timeout_sec=args.snmp_timeout,
+            delay_sec=args.snmp_delay,
+        )
+
+    if args.mode in ["all", "ftp"] and service.get("ftp"):
+        print(f"    [{host}] FTP TCP/21 open，測試常見帳密（{args.ftp_workers} 執行緒）")
+
+        ftp_results = audit_ftp_host(
+            host=host,
+            users=ftp_users,
+            passwords=ftp_passwords,
+            pairs=ftp_pairs,
+            mode=ftp_mode,
+            timeout_sec=args.ftp_timeout,
+            delay_sec=args.ftp_delay,
+            max_attempts=args.ftp_max_attempts,
+            find_all=args.ftp_find_all,
+            include_anonymous=not args.no_anonymous,
+            workers=args.ftp_workers,
+        )
+
+    return HostResult(
+        host=host,
+        ftp_open=service.get("ftp", False),
+        snmp_open=service.get("snmp", False),
+        ftp_results=ftp_results,
+        snmp_results=snmp_results,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -1107,6 +1221,20 @@ def parse_args() -> argparse.Namespace:
         help="不測試 anonymous FTP。",
     )
 
+    parser.add_argument(
+        "--ftp-workers",
+        type=int,
+        default=8,
+        help="每台主機同時測試的 FTP 帳密執行緒數。數字越大速度越快，對設備壓力也越大。預設：8",
+    )
+
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="同時稽核的主機數量（主機層級平行）。預設：4",
+    )
+
     return parser.parse_args()
 
 
@@ -1151,6 +1279,9 @@ def main() -> None:
             print(f"    FTP 帳號數         : {len(ftp_users)}")
             print(f"    FTP 密碼數         : {len(ftp_passwords)}")
             print(f"    FTP 最大組合數     : {len(ftp_users) * len(ftp_passwords)}")
+        print(f"    FTP 執行緒 / 主機   : {args.ftp_workers}")
+
+    print(f"    主機平行執行緒     : {args.workers}")
 
     discovered = nmap_scan_targets(
         targets=targets,
@@ -1162,48 +1293,21 @@ def main() -> None:
 
     final_results: List[HostResult] = []
 
-    for host, service in sorted(discovered.items()):
-        print(f"\n[*] 稽核主機：{host}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
+        host_futures = {
+            executor.submit(
+                _audit_one_host,
+                host, service, args,
+                communities, ftp_users, ftp_passwords, ftp_pairs, ftp_mode,
+            ): host
+            for host, service in sorted(discovered.items())
+        }
 
-        ftp_results: List[FTPResult] = []
-        snmp_results: List[SNMPResult] = []
+        for future in concurrent.futures.as_completed(host_futures):
+            final_results.append(future.result())
 
-        if args.mode in ["all", "snmp"] and service.get("snmp"):
-            print("    - SNMP UDP/161 open，測試 community string")
-
-            snmp_results = audit_snmp_host(
-                host=host,
-                communities=communities,
-                write_test=args.snmp_write_test,
-                timeout_sec=args.snmp_timeout,
-                delay_sec=args.snmp_delay,
-            )
-
-        if args.mode in ["all", "ftp"] and service.get("ftp"):
-            print("    - FTP TCP/21 open，測試常見帳密")
-
-            ftp_results = audit_ftp_host(
-                host=host,
-                users=ftp_users,
-                passwords=ftp_passwords,
-                pairs=ftp_pairs,
-                mode=ftp_mode,
-                timeout_sec=args.ftp_timeout,
-                delay_sec=args.ftp_delay,
-                max_attempts=args.ftp_max_attempts,
-                find_all=args.ftp_find_all,
-                include_anonymous=not args.no_anonymous,
-            )
-
-        final_results.append(
-            HostResult(
-                host=host,
-                ftp_open=service.get("ftp", False),
-                snmp_open=service.get("snmp", False),
-                ftp_results=ftp_results,
-                snmp_results=snmp_results,
-            )
-        )
+    # 依 IP 排序，保持報告順序一致
+    final_results.sort(key=lambda r: ipaddress.IPv4Address(r.host))
 
     summary = make_summary(final_results)
 
