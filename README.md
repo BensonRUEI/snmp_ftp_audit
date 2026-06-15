@@ -252,19 +252,19 @@ scan:123
 ### 掃描 SNMP 與 FTP
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode all --pn
+sudo python3 audit_snmp_ftp.py --mode all --pn
 ```
 
 ### 只掃描 SNMP
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode snmp --pn
+sudo python3 audit_snmp_ftp.py --mode snmp --pn
 ```
 
 ### 只掃描 FTP
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode ftp --pn
+sudo python3 audit_snmp_ftp.py --mode ftp --pn
 ```
 
 ---
@@ -297,7 +297,7 @@ sudo ./audit_snmp_ftp.py --mode ftp --pn
 ### 第一次盤點
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode all --pn
+sudo python3 audit_snmp_ftp.py --mode all --pn
 ```
 
 ---
@@ -305,7 +305,7 @@ sudo ./audit_snmp_ftp.py --mode all --pn
 ### 只做 SNMP community 稽核
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode snmp --pn
+sudo python3 audit_snmp_ftp.py --mode snmp --pn
 ```
 
 ---
@@ -313,13 +313,13 @@ sudo ./audit_snmp_ftp.py --mode snmp --pn
 ### 啟用 SNMP 可寫入測試
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode snmp --pn --snmp-write-test
+sudo python3 audit_snmp_ftp.py --mode snmp --pn --snmp-write-test
 ```
 
 或在完整掃描時啟用：
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode all --pn --snmp-write-test
+sudo .python3 audit_snmp_ftp.py --mode all --pn --snmp-write-test
 ```
 
 注意：`--snmp-write-test` 會執行 SNMP `SET` 操作。程式採用較保守方式，先讀取 `sysContact.0`，再將相同值寫回原 OID，但仍建議只在授權維護時段或測試環境中使用。
@@ -329,7 +329,7 @@ sudo ./audit_snmp_ftp.py --mode all --pn --snmp-write-test
 ### 只做 FTP 弱帳密檢查
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode ftp --pn
+sudo python3 audit_snmp_ftp.py --mode ftp --pn
 ```
 
 ---
@@ -337,7 +337,7 @@ sudo ./audit_snmp_ftp.py --mode ftp --pn
 ### 降低每台 FTP 主機嘗試次數
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode ftp --pn --ftp-max-attempts 50
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-max-attempts 50
 ```
 
 ---
@@ -345,7 +345,7 @@ sudo ./audit_snmp_ftp.py --mode ftp --pn --ftp-max-attempts 50
 ### 放慢 FTP 測試速度
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode ftp --pn --ftp-delay 1
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-delay 1
 ```
 
 ---
@@ -353,7 +353,7 @@ sudo ./audit_snmp_ftp.py --mode ftp --pn --ftp-delay 1
 ### 找出每台 FTP 所有成功帳密
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode ftp --pn --ftp-find-all
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-find-all
 ```
 
 ---
@@ -441,7 +441,7 @@ nano iprange.txt
 建議第一次執行：
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode all --pn --ftp-max-attempts 50 --ftp-delay 0.5
+sudo python3 audit_snmp_ftp.py --mode all --pn --ftp-max-attempts 50 --ftp-delay 0.5
 ```
 
 ---
@@ -461,7 +461,7 @@ ls -lh reports/
 確認維護時段與授權後，再執行：
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode snmp --pn --snmp-write-test
+sudo python3 audit_snmp_ftp.py --mode snmp --pn --snmp-write-test
 ```
 
 ---
@@ -519,7 +519,7 @@ admin
 請確認是否使用 root 權限：
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode all --pn
+sudo python3 audit_snmp_ftp.py --mode all --pn
 ```
 
 確認 nmap 是否安裝：
@@ -543,7 +543,7 @@ which nmap
 建議：
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode snmp --pn --max-retries 3 --snmp-timeout 3
+sudo python3 audit_snmp_ftp.py --mode snmp --pn --max-retries 3 --snmp-timeout 3
 ```
 
 ---
@@ -553,7 +553,7 @@ sudo ./audit_snmp_ftp.py --mode snmp --pn --max-retries 3 --snmp-timeout 3
 可降低每台主機嘗試次數：
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode ftp --pn --ftp-max-attempts 50
+sudo python3 audit_snmp_ftp.py --mode ftp --pn --ftp-max-attempts 50
 ```
 
 或調整字典，改用指定帳密模式。
@@ -573,8 +573,8 @@ sudo ./audit_snmp_ftp.py --mode ftp --pn --ftp-max-attempts 50
 也可以分別執行：
 
 ```bash
-sudo ./audit_snmp_ftp.py --mode snmp --pn
-sudo ./audit_snmp_ftp.py --mode ftp --pn
+sudo python3 audit_snmp_ftp.py --mode snmp --pn
+sudo python3 audit_snmp_ftp.py --mode ftp --pn
 ```
 
 ---
@@ -638,7 +638,7 @@ scan:scan
 scan:123
 EOF
 
-sudo ./audit_snmp_ftp.py --mode all --pn --ftp-max-attempts 50 --ftp-delay 0.5
+sudo python3 audit_snmp_ftp.py --mode all --pn --ftp-max-attempts 50 --ftp-delay 0.5
 ```
 
 查看報告：
