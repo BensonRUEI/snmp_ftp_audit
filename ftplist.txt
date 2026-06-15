@@ -1,0 +1,12 @@
+﻿scan
+123
+admin123
+123123
+admin
+password
+123456
+root
+guest
+administrator
+qwerty
+12345678

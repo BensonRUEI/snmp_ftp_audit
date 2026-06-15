@@ -1,0 +1,12 @@
+﻿public
+private
+community
+manager
+admin
+default
+monitor
+cisco
+read
+write
+public_rw
+private_rw
