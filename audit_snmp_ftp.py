@@ -10,6 +10,7 @@ import json
 import os
 import pty
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -43,6 +44,8 @@ class FTPResult:
     banner: Optional[str]
     note: Optional[str]
     file_list: Optional[List[str]] = None
+    fail_kind: Optional[str] = None  # 失敗類型："auth"(帳密錯誤) / "conn"(連線問題) / "other"；成功為 None
+    list_error: Optional[str] = None  # 登入成功但列根目錄失敗時的原因（None 表示成功或真的空目錄）
 
 
 @dataclass
@@ -67,9 +70,12 @@ def read_lines(path: str) -> List[str]:
 
     items: List[str] = []
 
-    with open(path, "r", encoding="utf-8") as f:
+    # 用 utf-8-sig 讀取以自動去除檔首 BOM；否則第一行會被黏上 \ufeff，
+    # 造成第一個 community / 帳密 / IP 對不上或格式錯誤（常見於 Windows 記事本存的檔）。
+    with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
-            item = line.strip()
+            # 再逐行防禦性清掉任何殘留 BOM（例如多檔串接時可能出現在中間）
+            item = line.replace("\ufeff", "").strip()
 
             if not item:
                 continue
@@ -830,71 +836,189 @@ def audit_snmp_host(
     return [results_by_index[i] for i in range(len(communities))]
 
 
+def _classify_ftp_error(exc: BaseException) -> str:
+    """
+    把 FTP 登入失敗分成三類，讓「密碼真的錯」和「被設備擋掉」不再混為一談：
+
+    - "auth" : 帳密錯誤（典型 530 Login incorrect / 430）。密碼就是不對，重試也沒用。
+    - "conn" : 連線層問題（連線被拒、逾時、421 連線數過多 / 服務不可用、被重置）。
+               這類是暫時性的，值得重試；也是防暴力破解 / 並行連線上限的典型徵兆。
+    - "other": 其他未分類錯誤。
+    """
+    if isinstance(exc, ftplib.error_perm):
+        msg = str(exc).strip()
+        # 5xx 永久錯誤：530/430 皆為帳密問題；其餘 5xx 在登入情境下同樣視為非連線類
+        return "auth"
+
+    if isinstance(exc, ftplib.error_temp):
+        # 4xx 暫時性錯誤，例如 421 Too many connections / service not available
+        return "conn"
+
+    if isinstance(exc, (socket.timeout, TimeoutError, ConnectionRefusedError,
+                        ConnectionResetError, ConnectionAbortedError, EOFError, OSError)):
+        return "conn"
+
+    return "other"
+
+
+def _decode_listing(raw: bytes) -> str:
+    """
+    目錄列表可能是任意編碼（繁中設備常見 Big5/CP950，簡中 GBK，日文 Shift-JIS…）。
+    依序嘗試常見編碼，全部失敗才用 replace 保底，確保永不因解碼而丟失整份列表。
+    """
+    for enc in ("utf-8", "cp950", "big5", "gbk", "gb18030", "shift_jis", "euc-kr"):
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _raw_list(ftp: ftplib.FTP, cmd: str) -> List[str]:
+    """
+    以二進位方式抓取 LIST / NLST 的原始位元組，避開 ftplib 內建以固定編碼解碼、
+    一遇非 UTF-8 檔名（如 Big5 中文）就整個拋例外的問題；抓回後自行容錯解碼。
+    """
+    buf = bytearray()
+    ftp.retrbinary(cmd, buf.extend)
+    text = _decode_listing(bytes(buf)).replace("\r\n", "\n").replace("\r", "\n")
+    return [line for line in text.split("\n") if line.strip()]
+
+
+def _ftp_list_root(ftp: ftplib.FTP) -> Tuple[Optional[List[str]], Optional[str]]:
+    """
+    列出登入後的根目錄，回傳 (file_list, error)。
+
+    FTP 的資料連線（LIST 用）不像控制連線那麼單純：
+    - 被動模式(PASV)可能因設備回報不可達的 IP、或防火牆擋資料埠而失敗。
+    - 主動模式(PORT)又可能因掃描端在 NAT 後、設備連不回來而失敗。
+    另外，目錄列表的位元組可能是 Big5 等非 UTF-8 編碼，若交給 ftplib 內建解碼會直接崩潰。
+
+    策略：先被動、再主動；每種模式都用原始位元組容錯解碼；LIST 若為空再用 NLST
+    交叉確認；兩者皆空視為真的空目錄；全部失敗則回傳錯誤原因，讓報告能明確區分
+    「真的空目錄」與「資料連線失敗」。
+    """
+    errors: List[str] = []
+
+    for pasv in (True, False):
+        mode_label = "PASV" if pasv else "PORT"
+
+        try:
+            ftp.set_pasv(pasv)
+
+            lines = _raw_list(ftp, "LIST")
+            if lines:
+                return lines, None
+
+            # LIST 成功但為空，改用 NLST 交叉確認（部分伺服器 LIST 空、NLST 卻有資料）
+            try:
+                names = [n for n in _raw_list(ftp, "NLST") if n not in (".", "..")]
+                if names:
+                    return names, None
+            except Exception as e:
+                errors.append(f"{mode_label}/NLST:{e}")
+
+            # 兩種列法都沒東西 → 視為真的空目錄
+            return [], None
+
+        except Exception as e:
+            errors.append(f"{mode_label}:{e}")
+            continue
+
+    return None, "; ".join(errors) if errors else "列目錄失敗"
+
+
 def try_ftp_login(
     host: str,
     username: str,
     password: str,
     timeout_sec: int,
+    conn_retries: int = 2,
+    retry_backoff: float = 0.5,
 ) -> FTPResult:
     """
-    嘗試單組 FTP 帳密。
+    嘗試單組 FTP 帳密，並對「連線類失敗」自動重試。
 
     改良重點：
-    原版對每一組帳密都額外開一條 daemon 執行緒、再用 join(timeout) 等待，
-    一旦逾時，那條背景執行緒仍占著 socket 繼續跑，無法真正中止；在「多主機 x
-    多帳密 x 多執行緒」下會累積大量殭屍連線，反而拖慢並吃滿資源。
-
-    這裡改為直接把逾時交給 ftplib 的 socket timeout：ftplib 會把此 timeout 同時
-    套用在控制連線與（LIST 用的）資料連線上，因此連線、讀 banner、登入、列目錄
-    每一步都有硬性上限，不需要外層執行緒，也不會留下殭屍連線。單組測試的最壞
-    耗時因此可預期，整體吞吐更穩定。
+    1. 逾時交給 ftplib 的 socket timeout（同時作用於控制連線與 LIST 資料連線），
+       不再另開 daemon 執行緒，避免逾時後殘留殭屍連線。
+    2. 區分「帳密錯誤」與「連線問題」：帳密錯誤不重試（密碼就是不對）；連線問題
+       重試最多 conn_retries 次，避免正確帳密因一次暫時性連線失敗（設備限流 / 防
+       暴力）被誤判成登入失敗——這正是「密碼在字典裡卻測不出來」的常見主因之一。
     """
-    ftp = ftplib.FTP()
     banner: Optional[str] = None
+    last_note: Optional[str] = None
+    last_kind: str = "other"
 
-    try:
-        # timeout 同時作用於控制連線與資料連線（CPython ftplib 會沿用 self.timeout）
-        ftp.connect(host=host, port=21, timeout=timeout_sec)
-        banner = ftp.getwelcome()
-        ftp.login(user=username, passwd=password)
-
-        # 登入成功後取得根目錄檔案列表（盡力而為，失敗不影響登入成功的判定）
-        file_list: List[str] = []
-        try:
-            listing: List[str] = []
-            ftp.dir(listing.append)
-            file_list = listing
-        except Exception:
-            file_list = []
+    attempt = 0
+    while attempt <= conn_retries:
+        attempt += 1
+        ftp = ftplib.FTP()
+        # 控制通道容錯：舊設備可能在 banner / 回應中夾帶非 UTF-8（如 Big5）位元組，
+        # latin-1 為全位元組對映、永不拋解碼例外；需在 connect 前設定才會套用到 welcome。
+        ftp.encoding = "latin-1"
 
         try:
-            ftp.quit()
-        except Exception:
-            pass
+            # timeout 同時作用於控制連線與資料連線（CPython ftplib 會沿用 self.timeout）
+            ftp.connect(host=host, port=21, timeout=timeout_sec)
+            banner = ftp.getwelcome()
+            ftp.login(user=username, passwd=password)
 
-        return FTPResult(
-            username=username,
-            password=password,
-            success=True,
-            banner=banner,
-            note=None,
-            file_list=file_list,
-        )
+            # 登入成功後取得根目錄檔案列表（盡力而為，失敗不影響登入成功的判定）
+            # 被動/主動雙模式嘗試，並在失敗時保留原因供報告呈現。
+            file_list, list_error = _ftp_list_root(ftp)
 
-    except Exception as e:
-        return FTPResult(
-            username=username,
-            password=password,
-            success=False,
-            banner=banner,
-            note=str(e),
-        )
+            try:
+                ftp.quit()
+            except Exception:
+                pass
 
-    finally:
-        try:
-            ftp.close()
-        except Exception:
-            pass
+            return FTPResult(
+                username=username,
+                password=password,
+                success=True,
+                banner=banner,
+                note=None,
+                file_list=file_list,
+                fail_kind=None,
+                list_error=list_error,
+            )
+
+        except Exception as e:
+            kind = _classify_ftp_error(e)
+            last_note = str(e)
+            last_kind = kind
+
+            # 帳密錯誤：密碼就是不對，直接回報，不浪費時間重試
+            if kind == "auth":
+                return FTPResult(
+                    username=username,
+                    password=password,
+                    success=False,
+                    banner=banner,
+                    note=last_note,
+                    fail_kind="auth",
+                )
+            # conn / other：落到下方重試
+
+        finally:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+        if attempt <= conn_retries:
+            time.sleep(retry_backoff)
+
+    # 連線類失敗且重試用盡
+    return FTPResult(
+        username=username,
+        password=password,
+        success=False,
+        banner=banner,
+        note=last_note,
+        fail_kind=last_kind,
+    )
 
 
 def audit_ftp_host(
@@ -909,6 +1033,7 @@ def audit_ftp_host(
     find_all: bool,
     include_anonymous: bool,
     workers: int = 8,
+    conn_retries: int = 2,
 ) -> List[FTPResult]:
     results: List[FTPResult] = []
     test_pairs: List[Tuple[str, str]] = []
@@ -921,31 +1046,91 @@ def audit_ftp_host(
     else:
         test_pairs.extend(list(itertools.product(users, passwords)))
 
-    if max_attempts > 0:
+    total_generated = len(test_pairs)
+    truncated = 0
+
+    if max_attempts > 0 and total_generated > max_attempts:
+        truncated = total_generated - max_attempts
         test_pairs = test_pairs[:max_attempts]
+        # 截斷不再靜默：明確告知使用者有多少組被丟棄
+        print(
+            f"    [{host}] 注意：共產生 {total_generated} 組帳密，"
+            f"因 --ftp-max-attempts={max_attempts} 只會測前 {max_attempts} 組，"
+            f"已忽略 {truncated} 組（用 --ftp-max-attempts 0 可測完整份清單）"
+        )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        # 一次提交所有任務；executor 依 workers 限制同時執行數，
-        # 未啟動的任務可透過 cancel() 跳過，達到 find_all=False 快速中止。
-        future_map = {
-            executor.submit(try_ftp_login, host, username, password, timeout_sec): (username, password)
-            for username, password in test_pairs
-        }
+    fail_counter = {"auth": 0, "conn": 0, "other": 0}
 
-        for future in concurrent.futures.as_completed(future_map):
-            try:
-                result = future.result()
-            except Exception:
-                continue
+    def _record_fail(r: FTPResult) -> None:
+        k = r.fail_kind if r.fail_kind in fail_counter else "other"
+        fail_counter[k] += 1
+
+    serial = workers <= 1
+
+    if serial:
+        # 序列模式：--ftp-delay 在此真正生效，每次嘗試間確實間隔，
+        # 對限制並行連線 / 有防暴力機制的嵌入式設備最安全。
+        for username, password in test_pairs:
+            result = try_ftp_login(
+                host, username, password, timeout_sec, conn_retries=conn_retries
+            )
 
             if result.success:
                 results.append(result)
-
                 if not find_all:
-                    # 取消尚未啟動的佇列任務
-                    for f in future_map:
-                        f.cancel()
                     break
+            else:
+                _record_fail(result)
+
+            if delay_sec > 0:
+                time.sleep(delay_sec)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(
+                    try_ftp_login, host, username, password, timeout_sec, conn_retries
+                ): (username, password)
+                for username, password in test_pairs
+            }
+
+            for future in concurrent.futures.as_completed(future_map):
+                try:
+                    result = future.result()
+                except Exception:
+                    continue
+
+                if result.success:
+                    results.append(result)
+
+                    if not find_all:
+                        for f in future_map:
+                            f.cancel()
+                        break
+                else:
+                    _record_fail(result)
+
+    # FTP 埠開著卻一組都沒成功時，印出失敗原因分解，讓「密碼真的不對」與
+    # 「被設備擋掉」一目了然，不必再靠猜。
+    if not results:
+        tested = fail_counter["auth"] + fail_counter["conn"] + fail_counter["other"]
+        print(
+            f"    [{host}] FTP 開啟但無成功登入：已測 {tested} 組 → "
+            f"帳密錯誤(5xx) {fail_counter['auth']}、"
+            f"連線被拒/逾時/限流 {fail_counter['conn']}、"
+            f"其他 {fail_counter['other']}"
+        )
+
+        if fail_counter["conn"] > 0 and fail_counter["conn"] >= max(1, fail_counter["auth"] // 2):
+            print(
+                f"    [{host}] 提示：連線類失敗偏多，可能是設備限制並行連線或觸發防暴力鎖定。"
+                f"建議 --ftp-workers 1、加大 --ftp-delay（如 1）、必要時降低 --ftp-max-attempts。"
+            )
+        elif mode == "wordlist" and fail_counter["auth"] == tested and tested > 0:
+            print(
+                f"    [{host}] 提示：全部為帳密錯誤。單字交叉模式需要「正確帳號」也在字典中，"
+                f"若正確帳號不在 ftplist.txt，任何密碼都配不出正確組合。"
+                f"可把正確帳號補進清單，或改用 user:password 指定帳密格式。"
+            )
 
     return results
 
@@ -1130,10 +1315,16 @@ def write_html_report(
         # 收集所有成功登入的檔案列表（帳密 + 清單）
         ftp_file_sections: List[str] = []
         for x in host_result.ftp_results:
-            if x.success and x.file_list is not None:
-                header = html_escape(f"{x.username}:{x.password}")
+            if not x.success:
+                continue
+            header = html_escape(f"{x.username}:{x.password}")
+            if x.file_list is not None:
                 entries = "<br>".join(html_escape(line) for line in x.file_list) if x.file_list else "（空目錄）"
-                ftp_file_sections.append(f"<b>{header}</b><br><pre style='margin:2px 0;font-size:12px'>{entries}</pre>")
+            elif x.list_error:
+                entries = f"（無法取得列表：{html_escape(x.list_error)}）"
+            else:
+                entries = "（空目錄）"
+            ftp_file_sections.append(f"<b>{header}</b><br><pre style='margin:2px 0;font-size:12px'>{entries}</pre>")
 
         snmp_readable = [
             x.community
@@ -1340,6 +1531,8 @@ def print_console_report(results: List[HostResult], summary: Dict[str, int]) -> 
                             print(f"          {entry}")
                     else:
                         print("        根目錄：（空目錄）")
+                elif login.list_error:
+                    print(f"        根目錄：（無法取得列表：{login.list_error}）")
 
         snmp_readable = [x for x in item.snmp_results if x.readable]
 
@@ -1410,6 +1603,7 @@ def _audit_one_host(
             find_all=args.ftp_find_all,
             include_anonymous=not args.no_anonymous,
             workers=args.ftp_workers,
+            conn_retries=args.ftp_conn_retries,
         )
 
     return HostResult(
@@ -1554,7 +1748,14 @@ def parse_args() -> argparse.Namespace:
         "--ftp-delay",
         type=float,
         default=0.2,
-        help="每次 FTP 登入測試間隔秒數。預設：0.2",
+        help="每次 FTP 登入測試間隔秒數（在 --ftp-workers 1 序列模式下生效，可避開設備限流）。預設：0.2",
+    )
+
+    parser.add_argument(
+        "--ftp-conn-retries",
+        type=int,
+        default=2,
+        help="FTP 遇到連線類錯誤（被拒/逾時/限流）時的重試次數；帳密錯誤不重試。預設：2",
     )
 
     parser.add_argument(
