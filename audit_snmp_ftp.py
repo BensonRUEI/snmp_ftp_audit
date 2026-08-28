@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 import argparse
 import concurrent.futures
 import csv
@@ -8,9 +8,11 @@ import ipaddress
 import itertools
 import json
 import os
+import pty
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -230,6 +232,78 @@ def run_command(cmd: List[str], timeout: int) -> Tuple[int, str, str]:
         return 124, "", "timeout"
 
 
+def run_nmap_streaming(cmd: List[str], timeout: int, stats_prefix: str) -> Tuple[int, str]:
+    """
+    以偽終端機（pty）執行 nmap。
+
+    nmap 只有在偵測到 stdout 是真正的終端機時，才會即時印出 -v /
+    --stats-every 的互動式進度訊息；一旦 stdout 被導向管線（例如一般的
+    subprocess.PIPE），這些訊息會被整批緩衝到掃描結束才吐出，即使
+    --stats-every 的間隔設得再短也一樣看不到即時進度。用 pty 讓 nmap
+    誤判為連到終端機，才能真正即時看到掃描進度。
+    """
+    master_fd, slave_fd = pty.openpty()
+
+    proc = subprocess.Popen(cmd, stdout=slave_fd, stderr=slave_fd, close_fds=True)
+    os.close(slave_fd)
+
+    output_lines: List[str] = []
+
+    def _emit(raw: bytes) -> None:
+        text = raw.decode("utf-8", errors="replace").rstrip("\r")
+        if text:
+            output_lines.append(text)
+            print(f"    {stats_prefix} {text}")
+
+    def _reader() -> None:
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break
+
+            if not chunk:
+                break
+
+            buf += chunk
+
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                _emit(line)
+
+        if buf:
+            _emit(buf)
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    rc: int
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = 124
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+
+    t.join(timeout=5)
+
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+
+    output = "\n".join(output_lines)
+
+    if rc == 124:
+        return 124, output or "timeout"
+
+    return rc, output
+
+
 def build_nmap_ports(mode: str) -> str:
     if mode == "all":
         return "T:21,U:161"
@@ -261,56 +335,13 @@ def build_nmap_scan_flags(mode: str) -> List[str]:
     raise ValueError(f"不支援的 mode：{mode}")
 
 
-def nmap_scan_targets(
-    targets: List[str],
-    mode: str,
-    host_timeout: str,
-    max_retries: int,
-    pn: bool,
-) -> Dict[str, Dict[str, bool]]:
-    discovered: Dict[str, Dict[str, bool]] = {}
-
-    ports = build_nmap_ports(mode)
-    scan_flags = build_nmap_scan_flags(mode)
-
-    cmd = [
-        "nmap",
-        "-oX",
-        "-",
-        *scan_flags,
-        "--open",
-        "-p",
-        ports,
-        "--max-retries",
-        str(max_retries),
-        "--host-timeout",
-        host_timeout,
-    ]
-
-    if pn:
-        cmd.append("-Pn")
-
-    cmd.extend(targets)
-
-    print("[*] 執行 nmap 掃描")
-    print(f"    模式：{mode}")
-    print(f"    {' '.join(cmd)}")
-
-    rc, stdout, stderr = run_command(cmd, timeout=7200)
-
-    if rc != 0:
-        print("[!] nmap 掃描失敗。請確認是否使用 sudo 執行，以及目標格式是否正確。", file=sys.stderr)
-
-        if stderr:
-            print(stderr, file=sys.stderr)
-
-        sys.exit(1)
-
+def _parse_nmap_xml_hosts(stdout: str, chunk_label: str) -> Dict[str, Dict[str, bool]]:
     try:
         root = ET.fromstring(stdout)
     except ET.ParseError as e:
-        print(f"[!] nmap XML 解析失敗：{e}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"nmap XML 解析失敗 {chunk_label}：{e}") from e
+
+    discovered: Dict[str, Dict[str, bool]] = {}
 
     for host in root.findall("host"):
         addr_elem = host.find("address[@addrtype='ipv4']")
@@ -354,6 +385,156 @@ def nmap_scan_targets(
                 "ftp": ftp_open,
                 "snmp": snmp_open,
             }
+
+    return discovered
+
+
+def split_targets(targets: List[str], n: int) -> List[List[str]]:
+    """
+    將目標清單以 round-robin 方式切成最多 n 份，讓大小不一的網段盡量平均分散到
+    各個分片，而不是把清單前段（可能剛好都是大網段）集中到同一份。
+    """
+    n = max(1, min(n, len(targets))) if targets else 1
+    chunks: List[List[str]] = [[] for _ in range(n)]
+
+    for i, target in enumerate(targets):
+        chunks[i % n].append(target)
+
+    return [chunk for chunk in chunks if chunk]
+
+
+def _nmap_scan_chunk(
+    targets: List[str],
+    mode: str,
+    host_timeout: str,
+    max_retries: int,
+    pn: bool,
+    stats_interval: str,
+    min_rate: Optional[int],
+    timing: str,
+    chunk_label: str,
+) -> Dict[str, Dict[str, bool]]:
+    ports = build_nmap_ports(mode)
+    scan_flags = build_nmap_scan_flags(mode)
+
+    xml_fd, xml_path = tempfile.mkstemp(prefix="nmap_audit_", suffix=".xml")
+    os.close(xml_fd)
+
+    try:
+        cmd = [
+            "nmap",
+            "-oX",
+            xml_path,
+            *scan_flags,
+            f"-T{timing}",
+            "--open",
+            "-p",
+            ports,
+            "--max-retries",
+            str(max_retries),
+            "--host-timeout",
+            host_timeout,
+            "--stats-every",
+            stats_interval,
+            "-v",
+        ]
+
+        if min_rate:
+            cmd.extend(["--min-rate", str(min_rate)])
+
+        if pn:
+            cmd.append("-Pn")
+
+        cmd.extend(targets)
+
+        print(f"[*] 執行 nmap 掃描 {chunk_label}（{len(targets)} 個目標）")
+        print(f"    {' '.join(cmd)}")
+
+        rc, output = run_nmap_streaming(cmd, timeout=7200, stats_prefix=chunk_label)
+
+        if rc != 0:
+            msg = f"nmap 掃描失敗 {chunk_label}。請確認是否使用 sudo 執行，以及目標格式是否正確。"
+
+            if output:
+                msg += f"\n{output}"
+
+            raise RuntimeError(msg)
+
+        with open(xml_path, "r", encoding="utf-8") as f:
+            xml_text = f.read()
+
+    finally:
+        try:
+            os.remove(xml_path)
+        except OSError:
+            pass
+
+    return _parse_nmap_xml_hosts(xml_text, chunk_label)
+
+
+def nmap_scan_targets(
+    targets: List[str],
+    mode: str,
+    host_timeout: str,
+    max_retries: int,
+    pn: bool,
+    nmap_workers: int = 1,
+    stats_interval: str = "10s",
+    min_rate: Optional[int] = None,
+    timing: str = "4",
+) -> Dict[str, Dict[str, bool]]:
+    print("[*] 執行 nmap 掃描")
+    print(f"    模式：{mode}")
+
+    target_chunks = split_targets(targets, nmap_workers)
+    total_chunks = len(target_chunks)
+
+    print(f"    目標總數：{len(targets)}，分成 {total_chunks} 個並行 nmap 分片（--nmap-workers={nmap_workers}）")
+
+    discovered: Dict[str, Dict[str, bool]] = {}
+    completed = 0
+    completed_lock = threading.Lock()
+    start_time = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=total_chunks) as executor:
+        future_to_label = {}
+
+        for idx, chunk in enumerate(target_chunks, start=1):
+            label = f"[nmap#{idx}/{total_chunks}]"
+            future = executor.submit(
+                _nmap_scan_chunk,
+                chunk,
+                mode,
+                host_timeout,
+                max_retries,
+                pn,
+                stats_interval,
+                min_rate,
+                timing,
+                label,
+            )
+            future_to_label[future] = label
+
+        for future in concurrent.futures.as_completed(future_to_label):
+            label = future_to_label[future]
+
+            try:
+                chunk_result = future.result()
+            except Exception as e:
+                print(f"[!] {e}", file=sys.stderr)
+                sys.exit(1)
+
+            discovered.update(chunk_result)
+
+            with completed_lock:
+                completed += 1
+                done = completed
+
+            elapsed = time.time() - start_time
+            print(
+                f"[進度] nmap 分片 {done}/{total_chunks} 完成 {label}，"
+                f"目前累積發現 {len(discovered)} 台主機，已耗時 {elapsed:.0f}s"
+            )
 
     return discovered
 
@@ -1169,6 +1350,33 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--nmap-workers",
+        type=int,
+        default=1,
+        help="將目標網段切成幾份，平行執行多個 nmap 掃描（網段很多時可提高此值加速）。預設：1",
+    )
+
+    parser.add_argument(
+        "--nmap-stats-interval",
+        default="10s",
+        help="nmap --stats-every 進度回報間隔，例如 5s、10s。預設：10s",
+    )
+
+    parser.add_argument(
+        "--nmap-min-rate",
+        type=int,
+        default=None,
+        help="nmap --min-rate，強制最低封包發送速率以加速掃描（過高可能造成漏包或被偵測）。預設：不設定",
+    )
+
+    parser.add_argument(
+        "--nmap-timing",
+        choices=["0", "1", "2", "3", "4", "5"],
+        default="4",
+        help="nmap 時間樣板 -T0~-T5，數字越大越快、對網路壓力越大。預設：4",
+    )
+
+    parser.add_argument(
         "--snmp-timeout",
         type=int,
         default=2,
@@ -1282,6 +1490,9 @@ def main() -> None:
         print(f"    FTP 執行緒 / 主機   : {args.ftp_workers}")
 
     print(f"    主機平行執行緒     : {args.workers}")
+    print(f"    nmap 並行分片數    : {args.nmap_workers}")
+    print(f"    nmap 進度回報間隔  : {args.nmap_stats_interval}")
+    print(f"    nmap 時間樣板      : -T{args.nmap_timing}")
 
     discovered = nmap_scan_targets(
         targets=targets,
@@ -1289,9 +1500,20 @@ def main() -> None:
         host_timeout=args.host_timeout,
         max_retries=args.max_retries,
         pn=args.pn,
+        nmap_workers=args.nmap_workers,
+        stats_interval=args.nmap_stats_interval,
+        min_rate=args.nmap_min_rate,
+        timing=args.nmap_timing,
     )
 
     final_results: List[HostResult] = []
+
+    total_hosts = len(discovered)
+    print(f"\n[*] nmap 探索完成，共 {total_hosts} 台主機需要稽核（主機平行執行緒={args.workers}）")
+
+    audit_completed = 0
+    audit_completed_lock = threading.Lock()
+    audit_start_time = time.time()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
         host_futures = {
@@ -1304,7 +1526,22 @@ def main() -> None:
         }
 
         for future in concurrent.futures.as_completed(host_futures):
+            host = host_futures[future]
             final_results.append(future.result())
+
+            with audit_completed_lock:
+                audit_completed += 1
+                done = audit_completed
+
+            elapsed = time.time() - audit_start_time
+            avg = elapsed / done if done else 0
+            remaining = (total_hosts - done) * avg
+            percent = (done * 100 // total_hosts) if total_hosts else 100
+
+            print(
+                f"[進度] 主機稽核 {done}/{total_hosts} 完成（{percent}%）"
+                f"最新完成：{host}，已耗時 {elapsed:.0f}s，預估剩餘 {remaining:.0f}s"
+            )
 
     # 依 IP 排序，保持報告順序一致
     final_results.sort(key=lambda r: ipaddress.IPv4Address(r.host))
