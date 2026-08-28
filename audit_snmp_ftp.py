@@ -32,6 +32,7 @@ class SNMPResult:
     writable: Optional[bool]
     sys_descr: Optional[str]
     note: Optional[str]
+    version: Optional[str] = None  # 讀取成功時實際使用的 SNMP 版本（1 或 2c）
 
 
 @dataclass
@@ -356,6 +357,7 @@ def _parse_nmap_xml_hosts(stdout: str, chunk_label: str) -> Dict[str, Dict[str, 
 
         ftp_open = False
         snmp_open = False
+        snmp_filtered = False  # UDP/161 為 open|filtered（不確定，但仍值得用 snmpget 實測）
 
         ports_elem = host.find("ports")
 
@@ -371,19 +373,27 @@ def _parse_nmap_xml_hosts(stdout: str, chunk_label: str) -> Dict[str, Dict[str, 
 
                 state = state_elem.attrib.get("state")
 
-                if state != "open":
-                    continue
-
+                # TCP/21：TCP 有三向交握，狀態可信，只認 open。
                 if proto == "tcp" and portid == "21":
-                    ftp_open = True
+                    if state == "open":
+                        ftp_open = True
 
+                # UDP/161：UDP 無交握，nmap 對未回應的 UDP 埠常標成 open|filtered。
+                # 若在此只認嚴格 "open"，會漏掉大量真的有開 SNMP 的設備。
+                # 因此 open 與 open|filtered 都視為候選，交給後續 snmpget 實測確認，
+                # snmpget 才是 SNMP 是否真的可達的最終判準。
                 if proto == "udp" and portid == "161":
-                    snmp_open = True
+                    if state == "open":
+                        snmp_open = True
+                    elif state == "open|filtered":
+                        snmp_filtered = True
 
-        if ftp_open or snmp_open:
+        if ftp_open or snmp_open or snmp_filtered:
             discovered[ip] = {
                 "ftp": ftp_open,
-                "snmp": snmp_open,
+                # open 或 open|filtered 都送進後續 SNMP 稽核流程
+                "snmp": snmp_open or snmp_filtered,
+                "snmp_filtered": snmp_filtered and not snmp_open,
             }
 
     return discovered
@@ -428,6 +438,7 @@ def _nmap_scan_chunk(
             *scan_flags,
             f"-T{timing}",
             "--open",
+            "-n",  # 稽核以 IP 為對象，關閉反向 DNS 解析，省下每台主機的 DNS 等待，明顯加速
             "-p",
             ports,
             "--max-retries",
@@ -438,6 +449,12 @@ def _nmap_scan_chunk(
             stats_interval,
             "-v",
         ]
+
+        # UDP 掃描（all / snmp 模式）容易被目標的 ICMP port-unreachable 速率限制拖慢。
+        # --defeat-icmp-ratelimit 讓 nmap 不再苦等被限速的 ICMP 回應，大幅加速 UDP 掃描；
+        # 我們只在意「開啟」的埠，故對本工具的判定準確度沒有負面影響。
+        if "-sU" in scan_flags:
+            cmd.append("--defeat-icmp-ratelimit")
 
         if min_rate:
             cmd.extend(["--min-rate", str(min_rate)])
@@ -539,27 +556,31 @@ def nmap_scan_targets(
     return discovered
 
 
-def snmp_get(
+def _snmp_get_one_version(
     host: str,
     community: str,
     oid: str,
     timeout_sec: int,
+    retries: int,
+    version: str,
 ) -> Tuple[bool, Optional[str], Optional[str]]:
     cmd = [
         "snmpget",
-        "-v2c",
+        f"-v{version}",
         "-c",
         community,
         "-t",
         str(timeout_sec),
         "-r",
-        "0",
+        str(retries),
         "-Oqv",
         host,
         oid,
     ]
 
-    rc, stdout, stderr = run_command(cmd, timeout=timeout_sec + 3)
+    # 逾時上限 = snmpget 自身逾時 x (重試次數+1) 再加緩衝，避免外層過早殺掉仍在重試的 snmpget
+    outer_timeout = timeout_sec * (retries + 1) + 3
+    rc, stdout, stderr = run_command(cmd, timeout=outer_timeout)
 
     if rc == 0 and stdout:
         value = stdout.strip()
@@ -572,12 +593,54 @@ def snmp_get(
     return False, None, stderr or stdout or "SNMP read failed"
 
 
+def snmp_get(
+    host: str,
+    community: str,
+    oid: str,
+    timeout_sec: int,
+    retries: int = 1,
+    versions: Optional[List[str]] = None,
+) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    """
+    依序嘗試多個 SNMP 版本（預設 2c 再 1），任一版本讀到就算成功。
+
+    這解決兩個常見的漏報：
+    1. 舊型印表機 / UPS / 工控與監控設備常常只支援 SNMPv1，原本只測 v2c 會整批漏掉。
+    2. SNMP 走 UDP，封包可能單純掉包；retries>0 可大幅降低「其實可讀卻被判為不可讀」的偽陰性。
+
+    回傳：(readable, value, note, version_used)
+    """
+    if versions is None:
+        versions = ["2c", "1"]
+
+    last_note: Optional[str] = None
+
+    for version in versions:
+        readable, value, note = _snmp_get_one_version(
+            host=host,
+            community=community,
+            oid=oid,
+            timeout_sec=timeout_sec,
+            retries=retries,
+            version=version,
+        )
+
+        if readable:
+            return True, value, None, version
+
+        last_note = note
+
+    return False, None, last_note or "SNMP read failed", None
+
+
 def snmp_set_same_value(
     host: str,
     community: str,
     oid: str,
     value: str,
     timeout_sec: int,
+    retries: int = 1,
+    version: str = "2c",
 ) -> Tuple[Optional[bool], Optional[str]]:
     """
     保守寫入測試：
@@ -586,23 +649,26 @@ def snmp_set_same_value(
     注意：
     這仍然是 SNMP SET 操作。
     建議只在授權維護時段或測試環境啟用。
+
+    version 應使用該 community 讀取成功時的版本，避免用錯版本造成偽陰性。
     """
     cmd = [
         "snmpset",
-        "-v2c",
+        f"-v{version}",
         "-c",
         community,
         "-t",
         str(timeout_sec),
         "-r",
-        "0",
+        str(retries),
         host,
         oid,
         "s",
         value,
     ]
 
-    rc, stdout, stderr = run_command(cmd, timeout=timeout_sec + 3)
+    outer_timeout = timeout_sec * (retries + 1) + 3
+    rc, stdout, stderr = run_command(cmd, timeout=outer_timeout)
 
     if rc == 0:
         return True, None
@@ -628,76 +694,140 @@ def snmp_set_same_value(
     return False, msg
 
 
+def _audit_one_community(
+    host: str,
+    community: str,
+    write_test: bool,
+    timeout_sec: int,
+    delay_sec: float,
+    retries: int,
+    versions: List[str],
+    serial: bool,
+) -> SNMPResult:
+    # 串列模式（snmp_workers==1）才套用 delay，維持對敏感設備的溫和節奏；
+    # 並行模式下已用執行緒數控制壓力，額外 sleep 只會拖慢整體。
+    if serial and delay_sec > 0:
+        time.sleep(delay_sec)
+
+    readable, sys_descr, read_note, version_used = snmp_get(
+        host=host,
+        community=community,
+        oid=SNMP_SYS_DESCR_OID,
+        timeout_sec=timeout_sec,
+        retries=retries,
+        versions=versions,
+    )
+
+    if not readable:
+        return SNMPResult(
+            community=community,
+            readable=False,
+            writable=None,
+            sys_descr=None,
+            note=read_note,
+            version=None,
+        )
+
+    writable: Optional[bool] = None
+    note: Optional[str] = None
+
+    if write_test:
+        # 用讀取成功的版本進行後續讀 / 寫，避免版本不一致造成偽陰性
+        set_version = version_used or "2c"
+
+        contact_ok, contact_value, contact_note, _ = snmp_get(
+            host=host,
+            community=community,
+            oid=SNMP_SYS_CONTACT_OID,
+            timeout_sec=timeout_sec,
+            retries=retries,
+            versions=[set_version],
+        )
+
+        if contact_ok and contact_value is not None:
+            writable, note = snmp_set_same_value(
+                host=host,
+                community=community,
+                oid=SNMP_SYS_CONTACT_OID,
+                value=contact_value,
+                timeout_sec=timeout_sec,
+                retries=retries,
+                version=set_version,
+            )
+        else:
+            writable = None
+            note = f"可讀，但無法讀取 sysContact.0 進行保守寫入測試：{contact_note}"
+
+    return SNMPResult(
+        community=community,
+        readable=True,
+        writable=writable,
+        sys_descr=sys_descr,
+        note=note,
+        version=version_used,
+    )
+
+
 def audit_snmp_host(
     host: str,
     communities: List[str],
     write_test: bool,
     timeout_sec: int,
     delay_sec: float,
+    retries: int = 1,
+    versions: Optional[List[str]] = None,
+    workers: int = 4,
 ) -> List[SNMPResult]:
-    results: List[SNMPResult] = []
+    """
+    測試單台主機的所有 SNMP community。
 
-    for community in communities:
-        readable, sys_descr, read_note = snmp_get(
-            host=host,
-            community=community,
-            oid=SNMP_SYS_DESCR_OID,
-            timeout_sec=timeout_sec,
-        )
+    相較原版的全串列逐一測試，這裡以執行緒池平行測試多個 community，
+    對「community 字典很長」或「設備逾時偏久」的情況能顯著縮短單台耗時。
+    仍會完整測試並回報每一個可讀 / 可寫 community，保留完整稽核證據。
+    """
+    if versions is None:
+        versions = ["2c", "1"]
 
-        if not readable:
-            results.append(
-                SNMPResult(
-                    community=community,
+    effective_workers = max(1, min(workers, len(communities))) if communities else 1
+    serial = effective_workers == 1
+
+    if serial:
+        return [
+            _audit_one_community(
+                host, community, write_test, timeout_sec,
+                delay_sec, retries, versions, serial=True,
+            )
+            for community in communities
+        ]
+
+    # 並行模式：保留與輸入相同的 community 順序，方便報告閱讀
+    results_by_index: Dict[int, SNMPResult] = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+        future_map = {
+            executor.submit(
+                _audit_one_community,
+                host, community, write_test, timeout_sec,
+                delay_sec, retries, versions, False,
+            ): idx
+            for idx, community in enumerate(communities)
+        }
+
+        for future in concurrent.futures.as_completed(future_map):
+            idx = future_map[future]
+            try:
+                results_by_index[idx] = future.result()
+            except Exception as e:
+                results_by_index[idx] = SNMPResult(
+                    community=communities[idx],
                     readable=False,
                     writable=None,
                     sys_descr=None,
-                    note=read_note,
+                    note=f"community 測試發生例外：{e}",
+                    version=None,
                 )
-            )
 
-            if delay_sec > 0:
-                time.sleep(delay_sec)
-
-            continue
-
-        writable: Optional[bool] = None
-        note: Optional[str] = None
-
-        if write_test:
-            contact_ok, contact_value, contact_note = snmp_get(
-                host=host,
-                community=community,
-                oid=SNMP_SYS_CONTACT_OID,
-                timeout_sec=timeout_sec,
-            )
-
-            if contact_ok and contact_value is not None:
-                writable, note = snmp_set_same_value(
-                    host=host,
-                    community=community,
-                    oid=SNMP_SYS_CONTACT_OID,
-                    value=contact_value,
-                    timeout_sec=timeout_sec,
-                )
-            else:
-                writable = None
-                note = f"可讀，但無法讀取 sysContact.0 進行保守寫入測試：{contact_note}"
-
-        results.append(
-            SNMPResult(
-                community=community,
-                readable=True,
-                writable=writable,
-                sys_descr=sys_descr,
-                note=note,
-            )
-        )
-
-        if delay_sec > 0:
-            time.sleep(delay_sec)
-
-    return results
+    return [results_by_index[i] for i in range(len(communities))]
 
 
 def try_ftp_login(
@@ -706,73 +836,65 @@ def try_ftp_login(
     password: str,
     timeout_sec: int,
 ) -> FTPResult:
-    # 整體逾時上限：connect + banner + USER + PASS + quit 各最多 timeout_sec，
-    # 加總最壞情況約 5x，設 4x 以避免設備太慢時無限卡住。
-    overall_timeout = timeout_sec * 4
-    result_holder: List[FTPResult] = []
+    """
+    嘗試單組 FTP 帳密。
 
-    def _do() -> None:
-        ftp = ftplib.FTP()
-        banner = None
+    改良重點：
+    原版對每一組帳密都額外開一條 daemon 執行緒、再用 join(timeout) 等待，
+    一旦逾時，那條背景執行緒仍占著 socket 繼續跑，無法真正中止；在「多主機 x
+    多帳密 x 多執行緒」下會累積大量殭屍連線，反而拖慢並吃滿資源。
+
+    這裡改為直接把逾時交給 ftplib 的 socket timeout：ftplib 會把此 timeout 同時
+    套用在控制連線與（LIST 用的）資料連線上，因此連線、讀 banner、登入、列目錄
+    每一步都有硬性上限，不需要外層執行緒，也不會留下殭屍連線。單組測試的最壞
+    耗時因此可預期，整體吞吐更穩定。
+    """
+    ftp = ftplib.FTP()
+    banner: Optional[str] = None
+
+    try:
+        # timeout 同時作用於控制連線與資料連線（CPython ftplib 會沿用 self.timeout）
+        ftp.connect(host=host, port=21, timeout=timeout_sec)
+        banner = ftp.getwelcome()
+        ftp.login(user=username, passwd=password)
+
+        # 登入成功後取得根目錄檔案列表（盡力而為，失敗不影響登入成功的判定）
+        file_list: List[str] = []
+        try:
+            listing: List[str] = []
+            ftp.dir(listing.append)
+            file_list = listing
+        except Exception:
+            file_list = []
 
         try:
-            ftp.connect(host=host, port=21, timeout=timeout_sec)
-            banner = ftp.getwelcome()
-            ftp.login(user=username, passwd=password)
+            ftp.quit()
+        except Exception:
+            pass
 
-            # 登入成功後取得根目錄檔案列表
-            file_list: Optional[List[str]] = None
-            try:
-                listing: List[str] = []
-                ftp.dir(listing.append)
-                file_list = listing if listing else []
-            except Exception:
-                file_list = []
+        return FTPResult(
+            username=username,
+            password=password,
+            success=True,
+            banner=banner,
+            note=None,
+            file_list=file_list,
+        )
 
-            try:
-                ftp.quit()
-            except Exception:
-                pass
+    except Exception as e:
+        return FTPResult(
+            username=username,
+            password=password,
+            success=False,
+            banner=banner,
+            note=str(e),
+        )
 
-            result_holder.append(FTPResult(
-                username=username,
-                password=password,
-                success=True,
-                banner=banner,
-                note=None,
-                file_list=file_list,
-            ))
-
-        except Exception as e:
-            result_holder.append(FTPResult(
-                username=username,
-                password=password,
-                success=False,
-                banner=banner,
-                note=str(e),
-            ))
-
-        finally:
-            try:
-                ftp.close()
-            except Exception:
-                pass
-
-    t = threading.Thread(target=_do, daemon=True)
-    t.start()
-    t.join(timeout=overall_timeout)
-
-    if result_holder:
-        return result_holder[0]
-
-    # 執行緒仍在跑表示整體逾時，daemon=True 確保程式結束時不阻擋
-    return FTPResult(
-        username=username,
-        password=password,
-        success=False,
-        banner=None,
-        note=f"整體連線逾時（>{overall_timeout}s）",
-    )
+    finally:
+        try:
+            ftp.close()
+        except Exception:
+            pass
 
 
 def audit_ftp_host(
@@ -1239,7 +1361,9 @@ def print_console_report(results: List[HostResult], summary: Dict[str, int]) -> 
                 if len(sysdescr) > 120:
                     sysdescr = sysdescr[:120] + "..."
 
-                print(f"    [+] {snmp.community} / writable={writable_text} / {sysdescr}")
+                version_text = f"v{snmp.version}" if snmp.version else "v?"
+
+                print(f"    [+] {snmp.community} / {version_text} / writable={writable_text} / {sysdescr}")
 
 
 def _audit_one_host(
@@ -1266,6 +1390,9 @@ def _audit_one_host(
             write_test=args.snmp_write_test,
             timeout_sec=args.snmp_timeout,
             delay_sec=args.snmp_delay,
+            retries=args.snmp_retries,
+            versions=args.snmp_versions_list,
+            workers=args.snmp_workers,
         )
 
     if args.mode in ["all", "ftp"] and service.get("ftp"):
@@ -1384,10 +1511,30 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--snmp-retries",
+        type=int,
+        default=1,
+        help="SNMP（snmpget/snmpset）重試次數。SNMP 走 UDP 易掉包，>0 可降低偽陰性。預設：1",
+    )
+
+    parser.add_argument(
+        "--snmp-versions",
+        default="2c,1",
+        help="要嘗試的 SNMP 版本，逗號分隔，依序測試，任一成功即算可讀。預設：2c,1（同時涵蓋只支援 v1 的舊設備）",
+    )
+
+    parser.add_argument(
+        "--snmp-workers",
+        type=int,
+        default=4,
+        help="每台主機同時測試的 SNMP community 執行緒數。設 1 為串列並套用 --snmp-delay。預設：4",
+    )
+
+    parser.add_argument(
         "--snmp-delay",
         type=float,
         default=0.1,
-        help="每次 SNMP 測試間隔秒數。預設：0.1",
+        help="每次 SNMP 測試間隔秒數（僅在 --snmp-workers=1 串列模式下生效）。預設：0.1",
     )
 
     parser.add_argument(
@@ -1443,7 +1590,26 @@ def parse_args() -> argparse.Namespace:
         help="同時稽核的主機數量（主機層級平行）。預設：4",
     )
 
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    # 解析並驗證 --snmp-versions（例如 "2c,1"）成清單，供 snmpget/snmpset 依序嘗試
+    allowed_versions = {"1", "2c"}
+    versions_list: List[str] = []
+    for token in args.snmp_versions.split(","):
+        token = token.strip().lower()
+        if not token:
+            continue
+        if token not in allowed_versions:
+            parser.error(f"--snmp-versions 只支援 1 與 2c，收到不支援的值：{token}")
+        if token not in versions_list:
+            versions_list.append(token)
+
+    if not versions_list:
+        parser.error("--snmp-versions 至少要指定一個版本（1 或 2c）")
+
+    args.snmp_versions_list = versions_list
+
+    return args
 
 
 def main() -> None:
@@ -1477,6 +1643,9 @@ def main() -> None:
 
     if args.mode in ["all", "snmp"]:
         print(f"    SNMP community 數量: {len(communities)}")
+        print(f"    SNMP 測試版本      : {','.join(args.snmp_versions_list)}")
+        print(f"    SNMP 重試次數      : {args.snmp_retries}")
+        print(f"    SNMP 執行緒 / 主機  : {args.snmp_workers}")
 
     if args.mode in ["all", "ftp"]:
         if ftp_mode == "pair":
